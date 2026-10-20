@@ -1,0 +1,346 @@
+name: SFDX Assign Permissions
+description: Composite action for assigning permission sets, permission set groups and permission set licenses to Salesforce org users.
+
+branding:
+  icon: user-check
+  color: blue
+
+inputs:
+  permission-sets:
+    description: >
+      Permission sets to assign, as a comma-separated or multi-line list of API names, e.g. "DreamHouse,CloudHouse".
+      Permission sets from a package can be referenced as "namespace__PermissionSet".
+    required: false
+  permission-set-groups:
+    description: >
+      Permission set groups to assign, as a comma-separated or multi-line list of API names (DeveloperName), e.g. "Sales_Manager".
+      Groups from a package can be referenced as "namespace__Group".
+      The Salesforce CLI has no command for permission set groups, so this action resolves them via SOQL and creates the assignment records itself.
+    required: false
+  permission-set-licenses:
+    description: >
+      Permission set licenses to assign, as a comma-separated or multi-line list of API names (DeveloperName), e.g. "SalesforceCPQ".
+    required: false
+  on-behalf-of:
+    description: >
+      Org users that should receive the permissions, as a comma-separated or multi-line list of usernames.
+      Defaults to the user the target org is authorized as, which is the admin user in a typical scratch org run.
+      CLI aliases, such as the ones set via "alias set", are resolved as well - do not use the Alias field of the User object.
+    required: false
+  target-org:
+    description: Username or alias of the target org. Not required if default org is already set.
+    required: false
+  api-version:
+    description: Override the api version used for api requests made by this action, for example '59.0'.
+    required: false
+  wait:
+    description: >
+      Number of minutes to wait for permission set groups to finish recalculating (status "Updated") before they are assigned.
+      A group that was just deployed is recalculated asynchronously, and assigning it too early can leave the user without the permissions it grants.
+      Set to 0 to assign groups immediately. Only relevant for the permission-set-groups input.
+    required: false
+    default: '5'
+  ignore-existing:
+    description: >
+      Treat "already assigned" errors as success, so re-running a workflow does not fail on permissions that are in place already.
+      Set to false to let duplicate assignments fail the step.
+    required: false
+    default: 'true'
+  step-summary:
+    description: Write a result section to the GitHub Actions job summary. Set to false to avoid collisions with a custom workflow summary.
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Assign Permissions
+      shell: bash
+      env:
+        PERMISSION_SETS: ${{ inputs.permission-sets }}
+        PERMISSION_SET_GROUPS: ${{ inputs.permission-set-groups }}
+        PERMISSION_SET_LICENSES: ${{ inputs.permission-set-licenses }}
+        ON_BEHALF_OF: ${{ inputs.on-behalf-of }}
+        TARGET_ORG: ${{ inputs.target-org }}
+        API_VERSION: ${{ inputs.api-version }}
+        WAIT: ${{ inputs.wait }}
+        IGNORE_EXISTING: ${{ inputs.ignore-existing }}
+        STEP_SUMMARY: ${{ inputs.step-summary }}
+      run: |
+        set -euo pipefail
+
+        # Arrays are expanded with the "${arr[@]+...}" guard: with "set -u" the
+        # plain expansion of an empty array aborts on Bash 3.2, which is what
+        # "shell: bash" still resolves to on the macOS runners.
+
+        # Splits a comma- or newline-separated input into the global SPLIT array
+        # and trims the surrounding whitespace, so that both notations work:
+        #   permission-sets: 'A,B'
+        #   permission-sets: |
+        #     A
+        #     B
+        split_list() {
+          SPLIT=()
+          local raw item
+          raw="${1//,/$'\n'}"
+          while IFS= read -r item; do
+            item="${item#"${item%%[![:space:]]*}"}"
+            item="${item%"${item##*[![:space:]]}"}"
+            if [[ -n "$item" ]]; then
+              SPLIT+=("$item")
+            fi
+          done <<< "$raw"
+        }
+
+        # Escapes a value for use inside a SOQL string literal.
+        soql_escape() {
+          local value="$1"
+          value="${value//\\/\\\\}"
+          value="${value//\'/\\\'}"
+          printf '%s' "$value"
+        }
+
+        # Runs a SOQL query against the target org and returns the JSON payload.
+        soql() {
+          sf data query --query "$1" --json ${common[@]+"${common[@]}"}
+        }
+
+        # Salesforce reports an assignment that is already in place as a
+        # "duplicate value found" error.
+        is_duplicate() {
+          [[ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" == *"duplicate value found"* ]]
+        }
+
+        # Renders an array as a comma-separated list of inline code spans.
+        join_code() {
+          local out="" item
+          for item in "$@"; do
+            if [[ -n "$out" ]]; then
+              out+=", "
+            fi
+            out+="\`$item\`"
+          done
+          printf '%s' "$out"
+        }
+
+        split_list "$PERMISSION_SETS"
+        permsets=(${SPLIT[@]+"${SPLIT[@]}"})
+        split_list "$PERMISSION_SET_GROUPS"
+        groups=(${SPLIT[@]+"${SPLIT[@]}"})
+        split_list "$PERMISSION_SET_LICENSES"
+        licenses=(${SPLIT[@]+"${SPLIT[@]}"})
+        split_list "$ON_BEHALF_OF"
+        assignees=(${SPLIT[@]+"${SPLIT[@]}"})
+
+        if [[ ${#permsets[@]} -eq 0 && ${#groups[@]} -eq 0 && ${#licenses[@]} -eq 0 ]]; then
+          echo "::error::Nothing to assign. Provide at least one of 'permission-sets', 'permission-set-groups' or 'permission-set-licenses'."
+          exit 1
+        fi
+
+        common=()
+
+        if [[ -n "$TARGET_ORG" ]]; then
+          common+=(--target-org "$TARGET_ORG")
+        fi
+
+        if [[ -n "$API_VERSION" ]]; then
+          common+=(--api-version "$API_VERSION")
+        fi
+
+        # Assigns permission sets or permission set licenses through the CLI.
+        # Both commands share the same flags and the same JSON result shape:
+        # { "result": { "successes": [...], "failures": [{ "message": ... }] } }
+        assign_via_cli() {
+          local subcommand="$1" label="$2"
+          shift 2
+
+          local args=(${common[@]+"${common[@]}"})
+          local name assignee
+          for name in "$@"; do
+            args+=(--name "$name")
+          done
+          for assignee in ${assignees[@]+"${assignees[@]}"}; do
+            args+=(--on-behalf-of "$assignee")
+          done
+
+          echo "Assigning $label: $*"
+
+          local output status=0
+          output=$(sf org assign "$subcommand" --json "${args[@]}") || status=$?
+
+          echo "$output" | jq '.'
+
+          if [[ $status -eq 0 ]]; then
+            return 0
+          fi
+
+          # A thrown error - bad authorization, unknown org, missing metadata -
+          # carries no result payload and is always fatal.
+          if [[ "$(echo "$output" | jq -r 'try (.result | has("failures")) catch false')" != "true" ]]; then
+            echo "::error::$(echo "$output" | jq -r '.message // empty')"
+            exit 1
+          fi
+
+          # Per-name failures are reported in the result payload. Assignments
+          # that already exist are tolerated when 'ignore-existing' is set, so
+          # that a re-run against a long-lived org stays green.
+          local message blocking=0
+          while IFS= read -r message; do
+            if [[ "$IGNORE_EXISTING" == "true" ]] && is_duplicate "$message"; then
+              echo "::notice::Already assigned, skipping: $message"
+            else
+              echo "::error::$message"
+              blocking=1
+            fi
+          done < <(echo "$output" | jq -r '.result.failures[]?.message')
+
+          if [[ $blocking -eq 1 ]]; then
+            exit 1
+          fi
+        }
+
+        # Licenses go first: a permission set can require the license that
+        # entitles the user to its permissions.
+        if [[ ${#licenses[@]} -gt 0 ]]; then
+          assign_via_cli permsetlicense "permission set license(s)" "${licenses[@]}"
+        fi
+
+        if [[ ${#permsets[@]} -gt 0 ]]; then
+          assign_via_cli permset "permission set(s)" "${permsets[@]}"
+        fi
+
+        if [[ ${#groups[@]} -gt 0 ]]; then
+          # "sf org assign permset" resolves names against the PermissionSet
+          # object only, so permission set groups have to be assigned through
+          # the data commands: look up the group, wait for its recalculation
+          # and create the PermissionSetAssignment record.
+
+          usernames=()
+          if [[ ${#assignees[@]} -gt 0 ]]; then
+            alias_json=$(sf alias list --json)
+            for assignee in "${assignees[@]}"; do
+              # Mirror the CLI behaviour: a value that matches a CLI alias is
+              # resolved to its username, anything else is assumed to be one.
+              resolved=$(echo "$alias_json" | jq -r --arg alias "$assignee" '[.result[]? | select(.alias == $alias) | .value] | first // empty')
+              usernames+=("${resolved:-$assignee}")
+            done
+          else
+            org_args=()
+            if [[ -n "$TARGET_ORG" ]]; then
+              org_args+=(--target-org "$TARGET_ORG")
+            fi
+
+            org_json=$(sf org display --json ${org_args[@]+"${org_args[@]}"})
+
+            # The payload carries a live access token - register it as a secret
+            # before any of it can end up in the log.
+            token=$(echo "$org_json" | jq -r '.result.accessToken // empty')
+            if [[ -n "$token" ]]; then
+              echo "::add-mask::$token"
+            fi
+
+            usernames+=("$(echo "$org_json" | jq -r '.result.username')")
+          fi
+
+          user_ids=()
+          for username in "${usernames[@]}"; do
+            user_id=$(soql "SELECT Id FROM User WHERE Username = '$(soql_escape "$username")'" | jq -r '.result.records[0].Id // empty')
+            if [[ -z "$user_id" ]]; then
+              echo "::error::No user found in the target org for username \"$username\"."
+              exit 1
+            fi
+            user_ids+=("$user_id")
+          done
+
+          echo "Assigning permission set group(s): ${groups[*]}"
+
+          for group in "${groups[@]}"; do
+            namespace=""
+            name="$group"
+            if [[ "$name" == *"__"* ]]; then
+              namespace="${name%%__*}"
+              name="${name#*__}"
+            fi
+
+            query="SELECT Id, Status FROM PermissionSetGroup WHERE DeveloperName = '$(soql_escape "$name")'"
+            if [[ -n "$namespace" ]]; then
+              query+=" AND NamespacePrefix = '$(soql_escape "$namespace")'"
+            fi
+
+            record=$(soql "$query" | jq -c '.result.records[0] // empty')
+            if [[ -z "$record" ]]; then
+              echo "::error::Permission set group \"$group\" not found in target org. Do you need to deploy source?"
+              exit 1
+            fi
+
+            group_id=$(echo "$record" | jq -r '.Id')
+            group_status=$(echo "$record" | jq -r '.Status')
+
+            if [[ "$group_status" == "Failed" ]]; then
+              echo "::error::Recalculation of permission set group \"$group\" failed. Check the group in Setup before assigning it."
+              exit 1
+            fi
+
+            deadline=$(( $(date +%s) + WAIT * 60 ))
+            while [[ "$group_status" != "Updated" && $(date +%s) -lt $deadline ]]; do
+              echo "Waiting for permission set group \"$group\" to be recalculated (status: $group_status)..."
+              sleep 10
+              group_status=$(soql "SELECT Status FROM PermissionSetGroup WHERE Id = '$group_id'" | jq -r '.result.records[0].Status')
+              if [[ "$group_status" == "Failed" ]]; then
+                echo "::error::Recalculation of permission set group \"$group\" failed. Check the group in Setup before assigning it."
+                exit 1
+              fi
+            done
+
+            if [[ "$group_status" != "Updated" ]]; then
+              # Not fatal on its own - the assignment may well go through. If
+              # Salesforce rejects it, the error below surfaces it.
+              echo "::warning::Permission set group \"$group\" is still in status \"$group_status\" after $WAIT minute(s). Assigning it anyway."
+            fi
+
+            for index in "${!user_ids[@]}"; do
+              user_id="${user_ids[$index]}"
+              username="${usernames[$index]}"
+
+              # Checked up front instead of parsing the duplicate error, so the
+              # log stays clean on re-runs against a long-lived org.
+              if [[ "$IGNORE_EXISTING" == "true" ]]; then
+                existing=$(soql "SELECT Id FROM PermissionSetAssignment WHERE AssigneeId = '$user_id' AND PermissionSetGroupId = '$group_id'" | jq -r '.result.records[0].Id // empty')
+                if [[ -n "$existing" ]]; then
+                  echo "::notice::Permission set group \"$group\" is already assigned to $username, skipping."
+                  continue
+                fi
+              fi
+
+              echo "Assigning permission set group \"$group\" to $username..."
+              sf data create record --sobject PermissionSetAssignment \
+                --values "AssigneeId=$user_id PermissionSetGroupId=$group_id" \
+                ${common[@]+"${common[@]}"}
+            done
+          done
+        fi
+
+        echo "✅ Successfully assigned all requested permissions"
+
+        if [[ "$STEP_SUMMARY" == "true" ]]; then
+          {
+            echo ""
+            echo "### 🛡️ Permissions assigned"
+            echo ""
+            if [[ ${#licenses[@]} -gt 0 ]]; then
+              echo "- **Permission set licenses:** $(join_code "${licenses[@]}")"
+            fi
+            if [[ ${#permsets[@]} -gt 0 ]]; then
+              echo "- **Permission sets:** $(join_code "${permsets[@]}")"
+            fi
+            if [[ ${#groups[@]} -gt 0 ]]; then
+              echo "- **Permission set groups:** $(join_code "${groups[@]}")"
+            fi
+            if [[ ${#assignees[@]} -gt 0 ]]; then
+              echo "- **Assigned to:** $(join_code "${assignees[@]}")"
+            else
+              echo "- **Assigned to:** authorized user of the target org"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
