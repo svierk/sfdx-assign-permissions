@@ -98,7 +98,7 @@ The following actions were also used in the example on this page:
 | `permission-set-licenses` | no | | Permission set licenses to assign, comma-separated or multi-line, referenced by their API name (`DeveloperName`), e.g. `SalesforceCPQ`. |
 | `on-behalf-of` | no | | Org users that receive the permissions, comma-separated or multi-line. Defaults to the user the target org is authorized as - the admin user in a typical scratch org run. |
 | `target-org` | no | | Username or alias of the target org. Not required if the default org is set. |
-| `api-version` | no | | Override the api version used for api requests, e.g. `59.0`. |
+| `api-version` | no | | Override the api version used for api requests, e.g. `68.0`. |
 | `wait` | no | `5` | Minutes to wait for permission set groups to finish recalculating before they are assigned. Set to `0` to assign them immediately. |
 | `ignore-existing` | no | `true` | Treat "already assigned" as success, so re-runs stay green. Set to `false` to let duplicate assignments fail the step. |
 | `step-summary` | no | `true` | Write a result section to the GitHub Actions [job summary](https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#adding-a-job-summary). Set to `false` to avoid collisions with a custom workflow summary. |
